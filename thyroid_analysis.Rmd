@@ -1,0 +1,418 @@
+---
+title: "ST494/ST694 Final Project - Thyroid Classification"
+output:
+  html_document:
+    df_print: paged
+---
+# ================================================
+# Date: 3rd April. 2025
+# Members: Aryan Jain (169044855), Rupesh Rangwani(169016076), Devesh Talreja (211516810)
+# ================================================
+
+
+# Step 1: Load required libraries
+
+```{r}
+# Step 1: Load required libraries
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(cluster)
+library(factoextra)
+library(randomForest)
+library(e1071)
+library(corrplot)
+
+```
+
+# Step 2: Load and Preprocess the Data
+```{r}
+# Step 1: Load the dataset
+thyroid_data <- read_csv("thyroid0387.data", col_names = FALSE)
+
+# Step 2: Assign proper column names
+colnames(thyroid_data) <- c(
+  "age", "sex", "on_thyroxine", "query_on_thyroxine", "on_antithyroid_medication",
+  "sick", "pregnant", "thyroid_surgery", "I131_treatment", "query_hypothyroid",
+  "query_hyperthyroid", "lithium", "goitre", "tumor", "hypopituitary", "psych",
+  "TSH_measured", "TSH", "T3_measured", "T3", "TT4_measured", "TT4", "T4U_measured",
+  "T4U", "FTI_measured", "FTI", "TBG_measured", "TBG", "referral_source", "diagnosis_record"
+)
+
+# Step 3: Extract diagnosis (e.g., "-", "F", "S", "F|G") and record_id
+thyroid_data <- thyroid_data %>%
+  mutate(
+    diagnosis = str_extract(diagnosis_record, "^[A-Z\\-\\|]+"),  # allows codes like F, F|G, -
+    record_id = str_extract(diagnosis_record, "\\[(.*?)\\]") %>% str_remove_all("\\[|\\]")
+  )
+
+# Step 4: Drop the original combined column
+thyroid_data <- thyroid_data %>% select(-diagnosis_record)
+
+# Step 5: View result
+table(thyroid_data$diagnosis, useNA = "ifany")
+
+
+```
+
+In Step 2, we assigned proper column names to the dataset based on the attribute descriptions and extracted two key pieces of information from the final column: the diagnosis label (e.g., "F", "S", "-") and the record ID (e.g., "840803047"). This step was essential to prepare the dataset for classification tasks by isolating the diagnosis label that we'll later use as the target variable. We confirmed the extraction using glimpse() and a frequency table.
+
+# Step 2.1: Map diagnosis to 4 classes: hyperthyroid, hypothyroid, normal, other
+```{r}
+# Step 1: Create a new column with 4 categories
+thyroid_data <- thyroid_data %>%
+  mutate(
+    diagnosis_class = case_when(
+      str_detect(diagnosis, "^-$") ~ "normal",
+      str_detect(diagnosis, "[ABCD]") ~ "hyperthyroid",
+      str_detect(diagnosis, "[EFGH]") ~ "hypothyroid",
+      TRUE ~ "other"
+    )
+  )
+
+# Step 2: Check class balance
+table(thyroid_data$diagnosis_class)
+
+```
+In Step 2.1, we simplified the original diagnosis codes into four broader classes: hyperthyroid, hypothyroid, normal, and other. This grouping allows for a cleaner multi-class classification problem. The class distribution shows that the dataset is highly imbalanced, with the majority of patients classified as normal (6771 cases), followed by other, hypothyroid, and a small portion as hyperthyroid. We’ll need to keep this imbalance in mind during model training and evaluation.
+
+# Step 2.2: Handle Missing Values
+```{r}
+# Step 1: Replace "?" with NA
+thyroid_data[thyroid_data == "?"] <- NA
+
+# Step 2: Check total missing values per column
+colSums(is.na(thyroid_data))
+
+# Step 3: View percentage of missing values
+missing_pct <- colMeans(is.na(thyroid_data)) * 100
+round(missing_pct, 2)
+
+```
+We replaced "?" values with NA and checked the percentage of missing values per column. Most columns have 0% missing, but some numeric medical test results like:
+T3 (28.4% missing)
+TBG (96.2% missing)
+TSH (9.2%)
+FTI, T4U, TT4 (around 8–9%)
+have notable gaps. These missing values likely occur when that particular test wasn’t performed for a patient.
+
+# Step 2.3: Clean and Impute Missing Data
+```{r}
+# Step 1: Drop TBG (too many missing values)
+thyroid_data <- thyroid_data %>% select(-TBG, -TBG_measured)
+
+# Step 2: Convert numeric columns from character to numeric
+num_cols <- c("TSH", "T3", "TT4", "T4U", "FTI")
+thyroid_data[num_cols] <- lapply(thyroid_data[num_cols], as.numeric)
+
+# Step 3: Impute missing numeric values with median
+for (col in num_cols) {
+  median_val <- median(thyroid_data[[col]], na.rm = TRUE)
+  thyroid_data[[col]][is.na(thyroid_data[[col]])] <- median_val
+}
+
+# Step 4: Confirm all missing values handled
+colSums(is.na(thyroid_data))
+
+```
+In Step 2.3, we cleaned the dataset by replacing "?" with NA, dropping the TBG column due to 96% missing data, and imputing missing values in numeric test results (TSH, T3, TT4, T4U, FTI) with their median. Now, the dataset is free of missing values and ready for modeling.
+
+# Step 3: Exploratory Data Analysis
+```{r}
+# Class distribution plot
+thyroid_data %>%
+  count(diagnosis_class) %>%
+  ggplot(aes(x = diagnosis_class, y = n, fill = diagnosis_class)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(n / sum(n) * 100, 1), "%")), vjust = -0.5) +
+  labs(title = "Diagnosis Class Distribution with Percentages",
+       x = "Diagnosis Class", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+The bar plot above shows a highly imbalanced class distribution. A majority of patients (approximately 73.8%) are labeled as "normal", while only 2.6% and 7.3% fall under "hyperthyroid" and "hypothyroid", respectively. This imbalance can impact model training and evaluation, especially for classifiers like SVM that are sensitive to unequal class sizes. Special care was taken to evaluate models using metrics beyond accuracy and to observe performance on minority classes.
+
+
+
+
+
+# Step 4: Encode Categorical Variables & Train-Test Split
+```{r}
+# Step 1: Convert categorical (logical/character) columns to factors
+factor_cols <- c(
+  "sex", "on_thyroxine", "query_on_thyroxine", "on_antithyroid_medication",
+  "sick", "pregnant", "thyroid_surgery", "I131_treatment", "query_hypothyroid",
+  "query_hyperthyroid", "lithium", "goitre", "tumor", "hypopituitary", "psych",
+  "TSH_measured", "T3_measured", "TT4_measured", "T4U_measured", "FTI_measured",
+  "referral_source", "diagnosis_class"
+)
+
+thyroid_data[factor_cols] <- lapply(thyroid_data[factor_cols], as.factor)
+
+# Step 2: Drop columns not needed for modeling
+thyroid_model <- thyroid_data %>%
+  select(-diagnosis, -record_id)  # remove ID and original label
+
+# Step 3: Split data into training and test sets (80-20)
+set.seed(123)
+train_indices <- sample(nrow(thyroid_model), 0.8 * nrow(thyroid_model))
+train_data <- thyroid_model[train_indices, ]
+test_data <- thyroid_model[-train_indices, ]
+
+# Step 4: Confirm split
+table(train_data$diagnosis_class)
+table(test_data$diagnosis_class)
+
+```
+We converted all relevant categorical variables to factors and split the cleaned dataset into training (80%) and testing (20%) sets. The class distributions in both sets reflect the original imbalance, with most patients labeled as "normal", and fewer cases of "hyperthyroid" and "hypothyroid". This highlights the need to consider class imbalance when evaluating classification results.
+
+# Step 5: Scaling for PCA and Clustering
+```{r}
+# Step 1: Identify numeric columns to scale
+numeric_features <- c("age", "TSH", "T3", "TT4", "T4U", "FTI")
+
+# Step 2: Standardize (z-score scaling)
+scaled_data <- scale(train_data[, numeric_features])
+
+# Step 3: Attach diagnosis class for plotting
+scaled_data <- as.data.frame(scaled_data)
+scaled_data$diagnosis_class <- train_data$diagnosis_class
+
+# Step 4: Preview
+head(scaled_data)
+
+```
+# Step 5.1: Outlier Detection with Boxplots
+```{r}
+# Step 1: Prepare a long-format version of scaled numeric data + class
+library(tidyr)
+
+box_data <- scaled_data %>%
+  pivot_longer(cols = c(TSH, TT4, FTI), names_to = "Variable", values_to = "Value")
+
+# Step 2: Boxplot of scaled values by diagnosis class
+ggplot(box_data, aes(x = diagnosis_class, y = Value, fill = diagnosis_class)) +
+  geom_boxplot(outlier.color = "red", alpha = 0.6) +
+  facet_wrap(~ Variable, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Outlier Detection: Boxplots of Key Thyroid Features",
+       x = "Diagnosis Class", y = "Standardized Value")
+```
+The boxplots of standardized thyroid features—FTI, TSH, and TT4—revealed distinct patterns across diagnosis classes. For FTI (Free Thyroxine Index), hyperthyroid cases exhibited notably higher values with several outliers on the high end, while hypothyroid cases had generally lower values, including some negative outliers. Normal cases, as expected, were tightly clustered near zero due to standardization. TSH (Thyroid-Stimulating Hormone) showed extreme outliers in hypothyroid cases, aligning with medical knowledge that TSH levels rise when thyroid function declines, while other classes, particularly normal cases, were closely grouped near zero. TT4 (Total Thyroxine) also displayed clear trends, with hyperthyroid patients showing elevated values and prominent outliers, whereas hypothyroid cases had lower values. Normal cases were tightly distributed, with only mild outliers. These outliers are not errors but rather medically significant extreme hormone levels that aid in distinguishing between thyroid conditions.
+
+
+# Step 5.2: Correlation Matrix
+```{r}
+# Step 1: Compute correlation matrix
+k_data <- scaled_data[, 1:6]
+cor_matrix <- cor(k_data)
+
+# Step 2: Plot heatmap of correlations
+library(ggcorrplot)
+ggcorrplot(cor_matrix, method = "circle", type = "lower",
+           lab = TRUE, lab_size = 3, colors = c("blue", "white", "red"),
+           title = "Correlation Matrix of Scaled Numeric Features",
+           ggtheme = theme_minimal())
+
+```
+TT4 and FTI show a strong positive correlation (0.74), which makes sense since FTI is derived from TT4 and T4U.
+
+TT4 and T3 (0.47) and TT4 and T4U (0.36) also show moderate positive correlation — all are indicators of thyroid hormone levels.
+
+TSH has weak negative correlations with other features, especially FTI (-0.26) and TT4 (-0.27), which again aligns with medical knowledge — high TSH usually occurs when thyroid hormones are low (hypothyroid).
+
+age has near-zero correlation with other features — suggesting it may not contribute strongly on its own.
+
+
+# Step 6: Principal Component Analysis (PCA)
+```{r}
+# Step 1: Perform PCA on scaled numeric data (exclude diagnosis class)
+pca_result <- prcomp(scaled_data[, 1:6], center = TRUE, scale. = TRUE)
+
+# Step 2: Create a dataframe with the first 2 principal components
+pca_df <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  diagnosis_class = scaled_data$diagnosis_class
+)
+
+# Step 3: Plot PCA
+library(ggplot2)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = diagnosis_class)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "PCA of Thyroid Dataset", x = "Principal Component 1", y = "Principal Component 2")
+
+```
+
+Principal Component 1 (PC1) and PC2 capture the most variance from the numeric features.
+
+We see some partial separation between classes — particularly:
+- Hypothyroid (green) and hyperthyroid (red) form clusters toward opposite ends
+- Normal (blue) is densely packed in the center and overlaps with others.
+- Other (purple) is spread across, showing overlap with all classes.
+
+This suggests that PCA can help reduce dimensionality and offers some class separability, especially for abnormal thyroid conditions. However, class overlap implies that further modeling (e.g., classification) is necessary to distinguish accurately.
+
+# Step 7: K-Means Clustering
+```{r}
+# Step 1: Use only the scaled numeric features for clustering
+k_data <- scaled_data[, 1:6]
+
+# Step 2: Find optimal number of clusters using the Elbow Method
+wss <- vector()
+for (k in 1:10) {
+  wss[k] <- kmeans(k_data, centers = k, nstart = 10)$tot.withinss
+}
+
+# Step 3: Plot Elbow Curve
+elbow_df <- data.frame(k = 1:10, wss = wss)
+ggplot(elbow_df, aes(x = k, y = wss)) +
+  geom_line() + geom_point() +
+  theme_minimal() +
+  labs(title = "Elbow Method for K-Means", x = "Number of Clusters (k)", y = "Within-Cluster Sum of Squares")
+
+```
+
+```{r}
+# Step 1: Recompute WSS
+wss <- sapply(1:10, function(k) {
+  kmeans(k_data, centers = k, nstart = 10)$tot.withinss
+})
+
+# Step 2: Compute WSS drop between successive k
+wss_diff <- c(NA, diff(wss))  # NA for first since no previous value
+
+# Step 3: Create dataframe to view
+elbow_info <- data.frame(
+  k = 1:10,
+  WSS = round(wss, 2),
+  WSS_Drop = round(wss_diff, 2)
+)
+
+# Step 4: Print
+print(elbow_info)
+
+
+```
+We can clearly see an “elbow” or inflection point at k = 3 or k = 4, which suggests that 3–4 clusters might be optimal for this dataset.
+
+Let’s proceed using k = 4 to see if the clusters match the four diagnosis classes: normal, hyperthyroid, hypothyroid, other.
+
+# Step 8: Final K-Means with k = 4
+```{r}
+# Step 1: Apply K-Means with k = 4
+set.seed(123)
+kmeans_final <- kmeans(k_data, centers = 4, nstart = 25)
+
+# Step 2: Add cluster labels to the PCA dataframe for plotting
+pca_df$cluster <- as.factor(kmeans_final$cluster)
+
+# Step 3: Visualize clusters over PCA projection
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "K-Means Clusters (k = 4) on PCA Projection")
+
+# Step 4: Compare clusters to diagnosis_class (confusion matrix)
+table(Cluster = kmeans_final$cluster, Diagnosis = scaled_data$diagnosis_class)
+
+```
+The PCA + K-means (k = 4) plot shows 4 fairly distinct clusters in reduced 2D space.
+
+Cluster 1 (red) is well-separated and dense — strongly associated with hyperthyroid.
+
+Cluster 2 (green) is dominated by normal cases.
+
+Cluster 3 (blue) overlaps with normal + other types.
+
+Cluster 4 (purple) is smaller, focused mostly on hypothyroid cases.
+
+We applied K-Means clustering with k = 4, as justified using the Elbow Method and WSS drop analysis. The clusters showed some alignment with thyroid conditions. One cluster aligned well with hyperthyroid, while another strongly matched normal patients. However, there was still some overlap between hypothyroid and other categories, indicating that unsupervised clustering alone may not perfectly capture medical class boundaries, though it does uncover useful structure in the data.
+
+
+# Step 9: Random Forest Classification
+```{r}
+# Step 0: Fix 'sex' column (handle missing values)
+levels(train_data$sex) <- c(levels(train_data$sex), "unknown")
+train_data$sex[is.na(train_data$sex)] <- "unknown"
+train_data$sex <- as.factor(train_data$sex)
+
+levels(test_data$sex) <- c(levels(test_data$sex), "unknown")
+test_data$sex[is.na(test_data$sex)] <- "unknown"
+test_data$sex <- as.factor(test_data$sex)
+
+# Step 1: Load required libraries
+library(randomForest)
+library(e1071)
+library(caret)  # for confusionMatrix with metrics
+
+# Step 2: Train Random Forest on training data
+set.seed(123)
+rf_model <- randomForest(diagnosis_class ~ ., data = train_data, importance = TRUE)
+
+# Step 3: Predict on test data
+rf_preds <- predict(rf_model, newdata = test_data)
+
+# Step 4: Confusion matrix and performance metrics
+rf_conf <- confusionMatrix(rf_preds, test_data$diagnosis_class)
+print(rf_conf)  # includes accuracy, sensitivity, specificity, etc.
+
+# Step 5: Accuracy
+cat("Random Forest Accuracy:", round(rf_conf$overall['Accuracy'] * 100, 2), "%\n")
+
+# Step 6: Variable importance plot
+varImpPlot(rf_model, main = "Random Forest Feature Importance")
+
+
+```
+
+
+Confusion Matrix & Accuracy
+Overall Accuracy: 95.1% — strong performance.
+
+Normal and Hypothyroid cases were classified with very high precision.
+
+Minor misclassifications occurred between hyperthyroid and other, which is expected due to overlapping symptoms/hormone levels.
+
+Actual	Predicted Mostly As
+Hyperthyroid	Hyperthyroid (36/46)
+Hypothyroid	Hypothyroid (135/143)
+Normal	Normal (1323/1368)
+Other	Other (251/281)
+this confirms that the model can reliably distinguish thyroid conditions, especially with clear lab features.
+
+# Step 10: Support Vector Machine (SVM)
+```{r}
+# Step 1: Train SVM on training data
+set.seed(123)
+svm_model <- svm(diagnosis_class ~ ., data = train_data, kernel = "radial")
+
+# Step 2: Predict on test data
+svm_preds <- predict(svm_model, newdata = test_data)
+
+# Step 3: Confusion matrix and performance metrics
+svm_conf <- confusionMatrix(svm_preds, test_data$diagnosis_class)
+print(svm_conf)  # includes precision, recall (sensitivity), F1-score
+
+# Step 4: Accuracy
+cat("SVM Accuracy:", round(svm_conf$overall['Accuracy'] * 100, 2), "%\n")
+
+```
+Confusion Matrix:
+Actual	Predicted Mostly As
+Hyperthyroid	Mostly correct (22/36), but confused with other
+Hypothyroid	62/135 correctly predicted
+Normal	Still well predicted (1314/1368)
+Other	Higher misclassification – more overlap with hypo/normal
+accuracy: 82.56%
+Lower than Random Forest (95.1%)
+
+Tends to confuse other with other classes
+
+May underperform when there’s class imbalance and many categorical variables
+
+
